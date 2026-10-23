@@ -1,0 +1,570 @@
+
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const { spawn } = require("child_process");
+const crypto = require("crypto");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const PUBLIC_DIR = path.join(__dirname, "public");
+const DOWNLOAD_DIR = path.join(__dirname, "downloads");
+const YT_DLP_PATH =
+  process.env.YT_DLP_PATH ||
+  path.join(__dirname, "yt-dlp-binary");
+
+const FFMPEG_PATH = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
+
+fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(PUBLIC_DIR));
+
+let torrentClient = null;
+let torrentInitError = null;
+
+import("webtorrent")
+  .then(({ default: WebTorrent }) => {
+    torrentClient = new WebTorrent();
+    console.log("Torrent engine ready");
+  })
+  .catch((error) => {
+    torrentInitError = error;
+    console.warn("Torrent engine could not start:", error.message);
+  });
+
+const jobs = new Map();
+
+// Validate HTTP and HTTPS URLs.
+function isValidHttpUrl(value) {
+  try {
+    const url = new URL(value);
+
+    return (
+      (url.protocol === "https:" || url.protocol === "http:") &&
+      Boolean(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Sanitize filenames before sending them to the browser.
+function safeFilename(name) {
+  return String(name || "download")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .slice(0, 180);
+}
+
+// Run yt-dlp and collect stdout and stderr.
+function runYtDlp(args, onProgress) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(YT_DLP_PATH, args, {
+      cwd: DOWNLOAD_DIR,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let progressBuffer = "";
+
+    function consumeProgress(chunk) {
+      progressBuffer += chunk.toString();
+
+      const lines = progressBuffer.split(/\r\n|\n|\r/);
+      progressBuffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const match = line.match(/KLIPORA_PROGRESS:\s*(\d+(?:\.\d+)?)/);
+        if (match && typeof onProgress === "function") {
+          const percent = Number(match[1]);
+          if (Number.isFinite(percent)) {
+            onProgress(Math.max(0, Math.min(99, percent)));
+          }
+        }
+      }
+
+      const match = progressBuffer.match(/KLIPORA_PROGRESS:\s*(\d+(?:\.\d+)?)/);
+      if (match && typeof onProgress === "function") {
+        const percent = Number(match[1]);
+        if (Number.isFinite(percent)) {
+          onProgress(Math.max(0, Math.min(99, percent)));
+        }
+      }
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      consumeProgress(chunk);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      consumeProgress(chunk);
+    });
+
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") {
+        reject(
+          new Error(
+            "yt-dlp binary was not found. Check YT_DLP_PATH and deployment permissions."
+          )
+        );
+      } else {
+        reject(error);
+      }
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(
+          new Error(
+            stderr.trim() ||
+              `yt-dlp exited with code ${code}`
+          )
+        );
+      }
+    });
+  });
+}
+
+// Ensure a path belongs to the downloads directory.
+function getSafeDownloadPath(filename) {
+  if (
+    typeof filename !== "string" ||
+    !filename ||
+    filename !== path.basename(filename)
+  ) {
+    return null;
+  }
+
+  const filePath = path.resolve(DOWNLOAD_DIR, filename);
+
+  if (!filePath.startsWith(DOWNLOAD_DIR + path.sep)) {
+    return null;
+  }
+
+  return filePath;
+}
+
+// Identify only a final media file, never a temporary fragment.
+function isFinalMediaFile(filename, expectedFormat) {
+  if (
+    /\.(part|ytdl|temp|tmp)$/i.test(filename) ||
+    /\.f\d+(?:\..*)?$/i.test(filename) ||
+    filename.endsWith(".info.json")
+  ) {
+    return false;
+  }
+
+  if (expectedFormat === "mp3") {
+    return /\.mp3$/i.test(filename);
+  }
+
+  if (expectedFormat === "mp4") {
+    return /\.mp4$/i.test(filename);
+  }
+
+  return /\.(mp4|webm|mkv|m4a|mp3|mov|avi|opus|ogg|wav|flac)$/i.test(
+    filename
+  );
+}
+
+// Health check.
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    videoDownloader: true,
+    audioDownloader: true,
+    torrentDownloader: Boolean(torrentClient),
+    torrentError: torrentInitError
+      ? torrentInitError.message
+      : null,
+  });
+});
+
+// Retrieve video information and offer MP4 and MP3.
+app.post("/api/info", async (req, res) => {
+  const { url } = req.body || {};
+
+  if (!isValidHttpUrl(url)) {
+    return res.status(400).json({
+      error: "Please provide a valid HTTP or HTTPS video URL.",
+    });
+  }
+
+  try {
+    const { stdout } = await runYtDlp([
+      "--dump-single-json",
+      "--no-warnings",
+      "--no-playlist",
+      "--",
+      url,
+    ]);
+
+    const info = JSON.parse(stdout);
+
+    res.json({
+      id: info.id,
+      title: info.title || "Untitled media",
+      thumbnail: info.thumbnail || null,
+      duration: info.duration || null,
+      uploader: info.uploader || null,
+      webpage_url: info.webpage_url || url,
+
+      formats: [
+        {
+          format_id: "best-mp4",
+          ext: "mp4",
+          resolution: "Best available",
+          filesize: null,
+          hasVideo: true,
+          hasAudio: true,
+          label: "MP4 — Video + Audio",
+        },
+        {
+          format_id: "mp3",
+          ext: "mp3",
+          resolution: "Audio only",
+          filesize: null,
+          hasVideo: false,
+          hasAudio: true,
+          label: "MP3 — Audio Only",
+        },
+      ],
+    });
+  } catch (error) {
+    res.status(500).json({
+      error:
+        error.message ||
+        "Could not retrieve media information.",
+    });
+  }
+});
+
+// Start an MP4, MP3, or explicitly requested format download.
+app.post("/api/download", async (req, res) => {
+  const { url, formatId } = req.body || {};
+
+  if (!isValidHttpUrl(url)) {
+    return res.status(400).json({
+      error: "Please provide a valid HTTP or HTTPS video URL.",
+    });
+  }
+
+  const selectedFormat = String(formatId || "best-mp4");
+  const isMp3 = selectedFormat.toLowerCase() === "mp3";
+  const isMp4 = selectedFormat === "best-mp4";
+
+  // Retain compatibility with numeric yt-dlp format IDs.
+  const isIndividualFormat =
+    /^\d+(?:\+\d+)?$/.test(selectedFormat);
+
+  if (!isMp3 && !isMp4 && !isIndividualFormat) {
+    return res.status(400).json({
+      error: "Unsupported format. Choose MP4 or MP3.",
+    });
+  }
+
+  const jobId = crypto.randomUUID();
+
+  const outputTemplate = path.join(
+    DOWNLOAD_DIR,
+    `${jobId}-%(title).150B.%(ext)s`
+  );
+
+  const args = [
+    "--js-runtimes",
+    "node",
+    "--no-warnings",
+    "--no-playlist",
+    "--newline",
+    "--progress",
+    "--progress-template",
+    "download:KLIPORA_PROGRESS:%(progress._percent)s",
+    "--restrict-filenames",
+    "-o",
+    outputTemplate,
+    "--print",
+    "after_move:filepath",
+  ];
+
+  
+if (isMp3) {
+  args.push(
+    "-f",
+    "bestaudio/best",
+    "-x",
+    "--audio-format",
+    "mp3",
+    "--audio-quality",
+    "192K",
+    "--ffmpeg-location",
+    FFMPEG_PATH
+  );
+} else if (isMp4) {
+  args.push(
+    "-f",
+    "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+    "--merge-output-format",
+    "mp4",
+    "--ffmpeg-location",
+    FFMPEG_PATH
+  );
+} else {
+  args.push("-f", selectedFormat);
+}
+
+  if (process.env.KLIPORA_LOCAL_CHROME_COOKIES === "1") {
+  args.push("--cookies-from-browser", "chrome");
+}
+
+args.push("--", url);
+
+  const job = {
+    id: jobId,
+    type: isMp3 ? "audio" : "video",
+    status: "downloading",
+    error: null,
+    filename: null,
+    createdAt: Date.now(),
+  };
+
+  jobs.set(jobId, job);
+
+  // Keep the existing asynchronous job API.
+  res.json({
+    jobId,
+    status: job.status,
+  });
+
+  runYtDlp(args, (progress) => {
+    job.progress = progress;
+    job.message = progress >= 99
+      ? "Finishing download..."
+      : "Downloading...";
+    console.log(`[Klipora] Download ${job.id}: ${progress}%`);
+  })
+    .then(({ stdout }) => {
+      // Prefer yt-dlp's final post-processing output.
+      const printedPaths = stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .reverse();
+
+      let finalPath = null;
+
+      for (const printedPath of printedPaths) {
+        const candidate = path.isAbsolute(printedPath)
+          ? path.resolve(printedPath)
+          : path.resolve(DOWNLOAD_DIR, printedPath);
+
+        if (
+          candidate.startsWith(DOWNLOAD_DIR + path.sep) &&
+          fs.existsSync(candidate) &&
+          fs.statSync(candidate).isFile() &&
+          isFinalMediaFile(
+            path.basename(candidate),
+            isMp3 ? "mp3" : isMp4 ? "mp4" : null
+          )
+        ) {
+          finalPath = candidate;
+          break;
+        }
+      }
+
+      // Fallback: inspect files belonging to this job only.
+      if (!finalPath) {
+        const candidates = fs
+          .readdirSync(DOWNLOAD_DIR)
+          .filter((file) => file.startsWith(`${jobId}-`))
+          .filter((file) =>
+            isFinalMediaFile(
+              file,
+              isMp3 ? "mp3" : isMp4 ? "mp4" : null
+            )
+          )
+          .filter((file) => {
+            const candidate = path.join(DOWNLOAD_DIR, file);
+
+            return (
+              fs.existsSync(candidate) &&
+              fs.statSync(candidate).isFile()
+            );
+          });
+
+        if (candidates.length === 1) {
+          finalPath = path.join(
+            DOWNLOAD_DIR,
+            candidates[0]
+          );
+        }
+      }
+
+      if (!finalPath) {
+        throw new Error(
+          "The download finished, but no valid final media file was found. Check FFmpeg, yt-dlp output, and supported formats."
+        );
+      }
+
+      job.filename = path.basename(finalPath);
+      job.progress = 100;
+      job.status = "completed";
+      job.message = "Download completed.";
+
+      console.log(
+        `Download completed: ${job.filename}`
+      );
+    })
+    .catch((error) => {
+      job.status = "failed";
+      job.error = error.message;
+
+      console.error(
+        `Download failed (${jobId}):`,
+        error.message
+      );
+    });
+});
+
+// Check download job status.
+app.get("/api/jobs/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({
+      error: "Download job not found.",
+    });
+  }
+
+  res.json({
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    error: job.error,
+    filename: job.filename,
+    progress: job.progress,
+    message: job.message,
+  });
+});
+
+// Download a completed file.
+app.get("/api/files/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+
+  if (
+    !job ||
+    job.status !== "completed" ||
+    !job.filename
+  ) {
+    return res.status(404).json({
+      error: "Completed download file not found.",
+    });
+  }
+
+  const filePath = getSafeDownloadPath(job.filename);
+
+  if (
+    !filePath ||
+    !fs.existsSync(filePath) ||
+    !fs.statSync(filePath).isFile()
+  ) {
+    return res.status(404).json({
+      error: "The downloaded file no longer exists.",
+    });
+  }
+
+  res.download(
+    filePath,
+    safeFilename(job.filename),
+    (error) => {
+      if (error && !res.headersSent) {
+        res.status(500).json({
+          error: "Could not send the downloaded file.",
+        });
+      }
+    }
+  );
+});
+
+// Start a torrent download using a magnet link.
+app.post("/api/torrent", (req, res) => {
+  const { magnet } = req.body || {};
+
+  if (
+    typeof magnet !== "string" ||
+    !magnet.startsWith("magnet:?")
+  ) {
+    return res.status(400).json({
+      error: "Please provide a valid magnet link.",
+    });
+  }
+
+  if (!torrentClient) {
+    return res.status(503).json({
+      error:
+        "Torrent engine is not ready. Please try again shortly.",
+    });
+  }
+
+  const jobId = crypto.randomUUID();
+
+  const job = {
+    id: jobId,
+    type: "torrent",
+    status: "downloading",
+    error: null,
+    filename: null,
+    createdAt: Date.now(),
+  };
+
+  jobs.set(jobId, job);
+
+  res.json({
+    jobId,
+    status: job.status,
+  });
+
+  try {
+    torrentClient.add(
+      magnet,
+      { path: DOWNLOAD_DIR },
+      (torrent) => {
+        job.torrentName = torrent.name || "Torrent download";
+
+        torrent.on("done", () => {
+          job.status = "completed";
+        });
+
+        torrent.on("error", (error) => {
+          job.status = "failed";
+          job.error = error.message;
+        });
+      }
+    );
+  } catch (error) {
+    job.status = "failed";
+    job.error = error.message;
+  }
+});
+
+// Serve the app.
+app.get("/", (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+});
+
+// Handle unknown API routes.
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    error: "API endpoint not found.",
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Klipora running on port ${PORT}`);
+});

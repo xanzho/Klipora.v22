@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131b">
+  <meta name="description" content="Klipora is a clean workspace for authorized media downloads.">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icons/klipora-192.png" type="image/png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Klipora">
+  <link rel="apple-touch-icon" href="/icons/klipora-192.png">
+  <title>Klipora — Video & Torrent Downloader</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Klipora home"><span class="brand-mark">K</span><span>Klipora</span></a>
+    <nav class="top-nav" aria-label="Main navigation">
+      <a href="#workspace">Workspace</a>
+      <a href="#activity">Activity</a>
+      <span class="local-tag"><span class="dot"></span> Local MVP</span>
+    </nav>
+  </header>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow"><span class="spark">✦</span> YOUR MEDIA WORKSPACE</div>
+      <h1>Media made<br><span>simple. Fast. Yours.</span></h1>
+      <p class="subtitle">A clean workspace for checking and saving media you own or are authorized to download.</p>
+      <div class="hero-pills" aria-label="Klipora highlights">
+        <span><i class="status-dot"></i> Simple workflow</span>
+        <span>Video + torrents</span>
+        <span>Privacy-conscious</span>
+      </div>
+    </section>
+    <section class="panel" id="workspace">
+      <div class="tabs" role="tablist">
+        <button class="tab active" id="videoTab" role="tab" aria-selected="true"><span>▶</span> Video downloader</button>
+        <button class="tab" id="torrentTab" role="tab" aria-selected="false"><span>↗</span> Torrent downloader</button>
+      </div>
+      <div id="videoPane" class="pane">
+        <label for="videoUrl">Video URL</label>
+        <div class="url-row"><input id="videoUrl" type="url" placeholder="https://www.youtube.com/watch?v=…" autocomplete="url"><button id="inspectBtn" class="button primary">Check video <span>→</span></button></div>
+        <p class="hint">Use supported sources and only download content you own or are authorized to save.</p>
+        <div id="videoDetails" class="details hidden">
+          <div class="video-meta"><img id="thumb" alt="" class="thumb hidden"><div><h3 id="videoTitle">Video title</h3><p id="videoSub" class="hint"></p></div></div>
+          <label for="formatSelect">Available format</label>
+          <select id="formatSelect"><option value="best">Best available quality</option></select>
+          <button id="downloadVideoBtn" class="button primary full">Download video <span>↓</span></button>
+        </div>
+      </div>
+      <div id="torrentPane" class="pane hidden">
+        <label for="magnetUrl">Magnet link</label>
+        <textarea id="magnetUrl" rows="3" placeholder="magnet:?xt=urn:btih:…"></textarea>
+        <p class="hint">This MVP accepts magnet links. Only use torrents for public-domain, openly licensed, or otherwise authorized content.</p>
+        <button id="downloadTorrentBtn" class="button primary full">Start torrent download <span>↓</span></button>
+      </div>
+    </section>
+    <section id="jobsSection" class="jobs-section hidden" aria-label="Download activity">
+      <div class="section-heading"><div><div class="eyebrow">ACTIVITY</div><h2>Your downloads</h2></div><button id="clearJobsBtn" class="button quiet">Clear completed</button></div>
+      <div id="jobsList" class="jobs-list"></div>
+    </section>
+    <section class="safety-note"><span class="shield">✓</span><div><strong>Private by default</strong><p>This development server listens on your Mac only. Keep it local until you have added authentication, worker isolation, and production security controls.</p></div></section>
+  </main>
+  <footer class="site-footer">
+    <div class="footer-brand"><span class="brand-mark">K</span><strong>Klipora</strong></div>
+    <p>Built for responsible downloads. Only save content you own or have permission to keep.</p>
+    <span class="footer-caption">KLIPORA <span>·</span> YOUR MEDIA WORKSPACE</span>
+  </footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+  <script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/service-worker.js")
+        .catch((error) => {
+          console.error("Klipora service worker registration failed:", error);
+        });
+    });
+  }
+</script>
+</body>
+</html>

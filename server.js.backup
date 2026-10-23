@@ -1,0 +1,356 @@
+
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const { spawn } = require("child_process");
+const crypto = require("crypto");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const PUBLIC_DIR = path.join(__dirname, "public");
+const DOWNLOAD_DIR = path.join(__dirname, "downloads");
+
+fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(PUBLIC_DIR));
+
+let torrentClient = null;
+let torrentInitError = null;
+
+// WebTorrent is an ES module, so load it with import().
+import("webtorrent")
+  .then(({ default: WebTorrent }) => {
+    torrentClient = new WebTorrent();
+    console.log("Torrent engine ready");
+  })
+  .catch((error) => {
+    torrentInitError = error;
+    console.warn(
+      "Torrent engine could not start:",
+      error.message
+    );
+  });
+
+const jobs = new Map();
+
+function isValidHttpUrl(value) {
+  try {
+    const url = new URL(value);
+
+    return (
+      (url.protocol === "https:" || url.protocol === "http:") &&
+      Boolean(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function safeFilename(name) {
+  return String(name || "download")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .slice(0, 180);
+}
+
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+  const path = require("path");
+
+const YT_DLP_PATH = path.join(__dirname, "yt-dlp-binary");
+
+const child = spawn(YT_DLP_PATH, args, {
+  cwd: DOWNLOAD_DIR,
+  stdio: ["ignore", "pipe", "pipe"],
+});
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      if (error.code === "ENOENT") {
+        reject(
+          new Error(
+            "yt-dlp is not installed or is not available in PATH."
+          )
+        );
+      } else {
+        reject(error);
+      }
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(
+          new Error(
+            stderr.trim() || `yt-dlp exited with code ${code}`
+          )
+        );
+      }
+    });
+  });
+}
+
+// Basic health check
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    videoDownloader: true,
+    torrentDownloader: Boolean(torrentClient),
+    torrentError: torrentInitError
+      ? torrentInitError.message
+      : null,
+  });
+});
+
+// Fetch video metadata
+app.post("/api/info", async (req, res) => {
+  const { url } = req.body || {};
+
+  if (!isValidHttpUrl(url)) {
+    return res.status(400).json({
+      error: "Please provide a valid HTTP or HTTPS video URL.",
+    });
+  }
+
+  try {
+    const { stdout } = await runYtDlp([
+      "--dump-single-json",
+      "--no-warnings",
+      "--no-playlist",
+      "--",
+      url,
+    ]);
+
+    const info = JSON.parse(stdout);
+
+    res.json({
+      id: info.id,
+      title: info.title || "Untitled video",
+      thumbnail: info.thumbnail || null,
+      duration: info.duration || null,
+      uploader: info.uploader || null,
+      webpage_url: info.webpage_url || url,
+      formats: (info.formats || [])
+        .filter(
+          (format) =>
+            format.format_id &&
+            (format.vcodec !== "none" || format.acodec !== "none")
+        )
+        .map((format) => ({
+          format_id: format.format_id,
+          ext: format.ext,
+          resolution: format.resolution || null,
+          filesize: format.filesize || format.filesize_approx || null,
+          hasVideo: format.vcodec !== "none",
+          hasAudio: format.acodec !== "none",
+        }))
+        .slice(0, 60),
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.message || "Could not retrieve video information.",
+    });
+  }
+});
+
+// Start a video download
+app.post("/api/download", async (req, res) => {
+  const { url, formatId } = req.body || {};
+
+  if (!isValidHttpUrl(url)) {
+    return res.status(400).json({
+      error: "Please provide a valid HTTP or HTTPS video URL.",
+    });
+  }
+
+  const jobId = crypto.randomUUID();
+
+  const outputTemplate = path.join(
+    DOWNLOAD_DIR,
+    `${jobId}-%(title).150B.%(ext)s`
+  );
+
+  const args = [
+    "--no-warnings",
+    "--no-playlist",
+    "--restrict-filenames",
+    "-o",
+    outputTemplate,
+  ];
+
+  if (
+    formatId &&
+    /^\d+(?:\+\d+)?$/.test(String(formatId))
+  ) {
+    args.push("-f", String(formatId));
+  } else {
+    args.push("-f", "bestvideo*+bestaudio/best");
+  }
+
+  args.push("--", url);
+
+  const job = {
+    id: jobId,
+    type: "video",
+    status: "downloading",
+    error: null,
+    filename: null,
+    createdAt: Date.now(),
+  };
+
+  jobs.set(jobId, job);
+
+  res.json({
+    jobId,
+    status: job.status,
+  });
+
+  runYtDlp(args)
+    .then(() => {
+      const files = fs.readdirSync(DOWNLOAD_DIR);
+
+      const matchingFile = files.find((file) =>
+        file.startsWith(`${jobId}-`)
+      );
+
+      job.status = "completed";
+      job.filename = matchingFile || null;
+    })
+    .catch((error) => {
+      job.status = "failed";
+      job.error = error.message;
+    });
+});
+
+// Check download progress/status
+app.get("/api/jobs/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+
+  if (!job) {
+    return res.status(404).json({
+      error: "Download job not found.",
+    });
+  }
+
+  res.json({
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    error: job.error,
+    filename: job.filename,
+  });
+});
+
+// Download a completed file
+app.get("/api/files/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+
+  if (
+    !job ||
+    job.status !== "completed" ||
+    !job.filename
+  ) {
+    return res.status(404).json({
+      error: "Completed download file not found.",
+    });
+  }
+
+  const filePath = path.join(DOWNLOAD_DIR, job.filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      error: "The downloaded file no longer exists.",
+    });
+  }
+
+  res.download(filePath, safeFilename(job.filename));
+});
+
+// Start a torrent download using a magnet link
+app.post("/api/torrent", (req, res) => {
+  const { magnet } = req.body || {};
+
+  if (
+    typeof magnet !== "string" ||
+    !magnet.startsWith("magnet:?")
+  ) {
+    return res.status(400).json({
+      error: "Please provide a valid magnet link.",
+    });
+  }
+
+  if (!torrentClient) {
+    return res.status(503).json({
+      error: "Torrent engine is not ready. Please try again shortly.",
+    });
+  }
+
+  const jobId = crypto.randomUUID();
+
+  const job = {
+    id: jobId,
+    type: "torrent",
+    status: "downloading",
+    error: null,
+    filename: null,
+    createdAt: Date.now(),
+  };
+
+  jobs.set(jobId, job);
+
+  res.json({
+    jobId,
+    status: job.status,
+  });
+
+  try {
+    torrentClient.add(
+      magnet,
+      { path: DOWNLOAD_DIR },
+      (torrent) => {
+        job.torrentName = torrent.name || "Torrent download";
+
+        torrent.on("done", () => {
+          job.status = "completed";
+        });
+
+        torrent.on("error", (error) => {
+          job.status = "failed";
+          job.error = error.message;
+        });
+      }
+    );
+  } catch (error) {
+    job.status = "failed";
+    job.error = error.message;
+  }
+});
+
+// Serve the app for browser navigation
+app.get("/", (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+});
+
+// Handle unknown API routes
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    error: "API endpoint not found.",
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Klipora running on port ${PORT}`);
+});

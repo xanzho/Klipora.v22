@@ -1,0 +1,599 @@
+
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+const jobs = new Map();
+let toastTimer;
+const pollingJobs = new Set();
+
+const TERMINAL_STATUSES = new Set([
+  "complete",
+  "completed",
+  "error",
+  "failed",
+  "cancelled"
+]);
+
+// Show notifications.
+function toast(message) {
+  const el = $("toast");
+
+  if (!el) {
+    console.log(message);
+    return;
+  }
+
+  el.textContent = message;
+  el.classList.add("show");
+
+  clearTimeout(toastTimer);
+
+  toastTimer = setTimeout(() => {
+    el.classList.remove("show");
+  }, 3500);
+}
+
+// API helper.
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await response.text();
+  let data = {};
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(
+      response.ok
+        ? "The server returned an invalid response."
+        : `API error (${response.status}). Check server logs.`
+    );
+  }
+
+  if (!response.ok || data.error) {
+    throw new Error(
+      data.error ||
+      data.message ||
+      `Request failed (${response.status})`
+    );
+  }
+
+  return data;
+}
+
+// Normalize server job responses.
+function normalizeJob(data) {
+  const job = { ...(data?.job || data || {}) };
+
+  if (!job.id && job.jobId) {
+    job.id = job.jobId;
+  }
+
+  if (!job.id) {
+    throw new Error("The server did not return a job ID.");
+  }
+
+  if (job.progress == null) {
+    job.progress = 0;
+  }
+
+  if (!job.status) {
+    job.status = "queued";
+  }
+
+  return job;
+}
+
+function isFinished(job) {
+  return TERMINAL_STATUSES.has(
+    String(job.status || "").toLowerCase()
+  );
+}
+
+// Video and torrent tabs.
+function setTab(which) {
+  const video = which === "video";
+
+  $("videoTab")?.classList.toggle("active", video);
+  $("torrentTab")?.classList.toggle("active", !video);
+
+  $("videoTab")?.setAttribute("aria-selected", String(video));
+  $("torrentTab")?.setAttribute("aria-selected", String(!video));
+
+  $("videoPane")?.classList.toggle("hidden", !video);
+  $("torrentPane")?.classList.toggle("hidden", video);
+}
+
+$("videoTab")?.addEventListener("click", () => setTab("video"));
+$("torrentTab")?.addEventListener("click", () => setTab("torrent"));
+
+// Thumbnail.
+function setThumbnail(url) {
+  const img = $("thumb");
+
+  if (!img) return;
+
+  try {
+    const parsed = new URL(url);
+
+    if (
+      parsed.protocol === "https:" ||
+      parsed.protocol === "http:"
+    ) {
+      img.src = parsed.href;
+      img.classList.remove("hidden");
+      return;
+    }
+  } catch {
+    // Ignore invalid thumbnail URLs.
+  }
+
+  img.removeAttribute("src");
+  img.classList.add("hidden");
+}
+
+// Format metadata.
+function getFormats(data) {
+  if (Array.isArray(data.formats)) return data.formats;
+  if (Array.isArray(data.availableFormats)) {
+    return data.availableFormats;
+  }
+
+  return [];
+}
+
+function formatLabel(format) {
+  if (format.format_id === "mp3") {
+    return "MP3 — Audio Only";
+  }
+
+  const height = format.height || format.resolution;
+  const ext = format.ext || format.extension || "media";
+
+  const hasAudio =
+    format.hasAudio ??
+    format.has_audio ??
+    format.acodec !== "none";
+
+  const size = format.filesize || format.filesize_approx;
+  const parts = [];
+
+  if (height) {
+    parts.push(
+      typeof height === "number" ? `${height}p` : height
+    );
+  }
+
+  parts.push(ext);
+  parts.push(hasAudio ? "audio included" : "video only");
+
+  if (size) {
+    parts.push(`${(size / 1048576).toFixed(1)} MB`);
+  }
+
+  return parts.join(" · ");
+}
+
+// Inspect URL and populate the format selector.
+$("inspectBtn")?.addEventListener("click", async () => {
+  const url = $("videoUrl")?.value.trim();
+
+  if (!url) {
+    toast("Paste a video URL first.");
+    return;
+  }
+
+  const button = $("inspectBtn");
+  button.disabled = true;
+  button.textContent = "Checking…";
+
+  $("videoDetails")?.classList.add("hidden");
+
+  try {
+    const data = await api("/api/info", {
+      method: "POST",
+      body: JSON.stringify({ url })
+    });
+
+    if (!Array.isArray(data.formats)) {
+      throw new Error(
+        "The server did not return a valid format list."
+      );
+    }
+
+    if ($("videoTitle")) {
+      $("videoTitle").textContent = data.title || "Media";
+    }
+
+    if ($("videoSub")) {
+      $("videoSub").textContent = [
+        data.uploader || data.channel || "",
+        data.duration
+          ? `${Math.round(Number(data.duration))} sec`
+          : ""
+      ].filter(Boolean).join(" · ");
+    }
+
+    setThumbnail(data.thumbnail || "");
+
+    const select = $("formatSelect");
+
+    if (!select) {
+      throw new Error("Format selector not found in index.html.");
+    }
+
+    select.replaceChildren();
+
+    // OPTION 1: MP4 video with audio.
+    const mp4 = document.createElement("option");
+    mp4.value = "best-mp4";
+    mp4.textContent = "MP4 — Video + Audio";
+    mp4.selected = true;
+    select.appendChild(mp4);
+
+    // OPTION 2: MP3 audio only.
+    const mp3 = document.createElement("option");
+    mp3.value = "mp3";
+    mp3.textContent = "MP3 — Audio Only (Music / Podcast)";
+    select.appendChild(mp3);
+
+    // Additional combined formats, when supported by the backend.
+    const seen = new Set(["best-mp4", "mp3"]);
+
+    for (const format of getFormats(data)) {
+      const rawId = format.format_id ?? format.formatId;
+
+      if (rawId == null) continue;
+
+      const formatId = String(rawId);
+
+      if (seen.has(formatId)) continue;
+
+      const hasVideo =
+        format.hasVideo === true ||
+        format.has_video === true ||
+        (
+          Boolean(format.vcodec) &&
+          format.vcodec !== "none"
+        );
+
+      const hasAudio =
+        format.hasAudio === true ||
+        format.has_audio === true ||
+        (
+          Boolean(format.acodec) &&
+          format.acodec !== "none"
+        );
+
+      // Don't add audio-only or video-only streams as extra options.
+      if (!hasVideo || !hasAudio) continue;
+
+      // Current backend supports numeric format IDs only.
+      if (!/^\d+$/.test(formatId)) continue;
+
+      seen.add(formatId);
+
+      const option = document.createElement("option");
+      option.value = formatId;
+      option.textContent = formatLabel(format);
+
+      select.appendChild(option);
+    }
+
+    $("videoDetails")?.classList.remove("hidden");
+
+    toast("Media information loaded. Choose MP4 or MP3.");
+  } catch (error) {
+    toast(error.message || "Could not inspect this media.");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Check video →";
+  }
+});
+
+// Start an MP4 or MP3 download.
+$("downloadVideoBtn")?.addEventListener("click", async () => {
+  const url = $("videoUrl")?.value.trim();
+  const select = $("formatSelect");
+
+  const formatId = select?.value || "best-mp4";
+
+  if (!url) {
+    toast("Paste a video URL first.");
+    return;
+  }
+
+  if (!["best-mp4", "mp3"].includes(formatId) &&
+      !/^\d+$/.test(formatId)) {
+    toast("Please choose a supported download format.");
+    return;
+  }
+
+  const button = $("downloadVideoBtn");
+  button.disabled = true;
+
+  try {
+    const data = await api("/api/download", {
+      method: "POST",
+      body: JSON.stringify({
+        url,
+        formatId
+      })
+    });
+
+    addJob({
+      ...data,
+      type: formatId === "mp3" ? "audio" : "video",
+      title:
+        formatId === "mp3"
+          ? "MP3 Audio Download"
+          : "MP4 Video Download"
+    });
+
+    toast(
+      formatId === "mp3"
+        ? "MP3 audio download started."
+        : "MP4 video download started."
+    );
+  } catch (error) {
+    toast(error.message || "Could not start the download.");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// Start a torrent download.
+$("downloadTorrentBtn")?.addEventListener("click", async () => {
+  const magnet = $("magnetUrl")?.value.trim();
+
+  if (!magnet) {
+    toast("Paste a magnet link first.");
+    return;
+  }
+
+  if (!magnet.startsWith("magnet:?")) {
+    toast("Please enter a valid magnet link.");
+    return;
+  }
+
+  const button = $("downloadTorrentBtn");
+  button.disabled = true;
+
+  try {
+    const data = await api("/api/torrent", {
+      method: "POST",
+      body: JSON.stringify({ magnet })
+    });
+
+    addJob({
+      ...data,
+      type: "torrent",
+      title: "Torrent Download"
+    });
+
+    toast("Torrent job started.");
+  } catch (error) {
+    toast(error.message || "Could not start the torrent.");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// Add job and start polling.
+function addJob(data) {
+  let job;
+
+  try {
+    job = normalizeJob(data);
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+
+  jobs.set(String(job.id), job);
+
+  $("jobsSection")?.classList.remove("hidden");
+  renderJobs();
+
+  if (!isFinished(job)) {
+    pollJob(String(job.id));
+  }
+}
+
+// Poll job status.
+async function pollJob(id) {
+  if (pollingJobs.has(id)) return;
+
+  pollingJobs.add(id);
+
+  try {
+    while (jobs.has(id)) {
+      const current = jobs.get(id);
+
+      if (isFinished(current)) break;
+
+      await new Promise(resolve => setTimeout(resolve, 1600));
+
+      if (!jobs.has(id)) break;
+
+      try {
+        const data = await api(
+          `/api/jobs/${encodeURIComponent(id)}`
+        );
+
+        const updated = normalizeJob(data);
+
+        jobs.set(id, {
+          ...jobs.get(id),
+          ...updated,
+          id
+        });
+
+        renderJobs();
+      } catch (error) {
+        const latest = jobs.get(id);
+        if (!latest) break;
+
+        latest.pollErrors = (latest.pollErrors || 0) + 1;
+
+        if (latest.pollErrors >= 3) {
+          jobs.set(id, {
+            ...latest,
+            status: "error",
+            message:
+              error.message || "Could not check job status."
+          });
+
+          renderJobs();
+          break;
+        }
+      }
+    }
+  } finally {
+    pollingJobs.delete(id);
+  }
+}
+
+// Format file sizes.
+function formatBytes(value) {
+  let n = Number(value);
+
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return `${n} B`;
+
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+
+  do {
+    n /= 1024;
+    i++;
+  } while (n >= 1024 && i < units.length - 1);
+
+  return `${n.toFixed(1)} ${units[i]}`;
+}
+
+// Render download jobs.
+function renderJobs() {
+  const list = $("jobsList");
+
+  if (!list) return;
+
+  list.replaceChildren();
+
+  for (const job of [...jobs.values()].reverse()) {
+    const card = document.createElement("article");
+    card.className = "job";
+
+    const top = document.createElement("div");
+    top.className = "job-top";
+
+    const info = document.createElement("div");
+
+    const title = document.createElement("h3");
+    title.textContent =
+      job.title ||
+      (
+        job.type === "torrent"
+          ? "Torrent Download"
+          : job.type === "audio"
+            ? "MP3 Audio Download"
+            : "Video Download"
+      );
+
+    const msg = document.createElement("p");
+    msg.textContent = job.message || job.error || job.status || "Working…";
+
+    info.append(title, msg);
+
+    const status = document.createElement("span");
+    status.className = "status";
+    status.textContent = job.status || "queued";
+
+    top.append(info, status);
+
+    const bar = document.createElement("div");
+    bar.className = "progress";
+
+    const fill = document.createElement("span");
+
+    const progress = ["complete", "completed"].includes(
+      String(job.status || "").toLowerCase()
+    )
+      ? 100
+      : Math.max(0, Math.min(100, Number(job.progress) || 0));
+
+    fill.style.width = `${progress}%`;
+    bar.append(fill);
+
+    const sub = document.createElement("p");
+    const size = job.size ? ` · ${formatBytes(job.size)}` : "";
+
+    sub.textContent = `${Math.round(progress)}%${size}`;
+
+    card.append(top, bar, sub);
+
+    const actions = document.createElement("div");
+    actions.className = "job-actions";
+
+    const statusValue = String(job.status || "").toLowerCase();
+
+    if (["complete", "completed"].includes(statusValue)) {
+      const link = document.createElement("a");
+
+      link.href =
+        job.downloadUrl ||
+        `/api/files/${encodeURIComponent(job.id)}`;
+
+      link.textContent = "Download file ↓";
+      link.setAttribute("download", "");
+
+      actions.append(link);
+    }
+
+    if (isFinished(job)) {
+      const dismiss = document.createElement("button");
+
+      dismiss.type = "button";
+      dismiss.textContent = "Dismiss";
+
+      dismiss.addEventListener("click", () => {
+        jobs.delete(String(job.id));
+        renderJobs();
+
+        if (jobs.size === 0) {
+          $("jobsSection")?.classList.add("hidden");
+        }
+      });
+
+      actions.append(dismiss);
+    }
+
+    if (actions.childNodes.length) {
+      card.append(actions);
+    }
+
+    list.append(card);
+  }
+}
+
+// Clear completed jobs from the interface.
+$("clearJobsBtn")?.addEventListener("click", () => {
+  for (const [id, job] of jobs.entries()) {
+    if (isFinished(job)) {
+      jobs.delete(id);
+    }
+  }
+
+  renderJobs();
+
+  if (jobs.size === 0) {
+    $("jobsSection")?.classList.add("hidden");
+  }
+});
